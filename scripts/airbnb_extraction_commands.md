@@ -114,8 +114,3 @@ python src/airbnb_dashboard.py \
 ## Windows end-to-end setup
 
 See `WINDOWS_AIRBNB_SETUP.md` for clone/pull, install, extraction, and UI launch steps on Windows.
-
-
-## Linux/WSL end-to-end setup
-
-See `LINUX_WSL_AIRBNB_SETUP.md` for clone/pull, dependency install, extraction, and UI launch on Linux/WSL.
