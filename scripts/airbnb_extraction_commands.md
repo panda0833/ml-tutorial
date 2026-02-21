@@ -109,3 +109,8 @@ python src/airbnb_dashboard.py \
   --db-path data/airbnb_search_results.db \
   --port 8080
 ```
+
+
+## Windows end-to-end setup
+
+See `WINDOWS_AIRBNB_SETUP.md` for clone/pull, install, extraction, and UI launch steps on Windows.
