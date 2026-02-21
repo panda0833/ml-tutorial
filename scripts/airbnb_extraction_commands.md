@@ -84,6 +84,7 @@ python scripts/extract_airbnb_search_results.py \
   --max-scrolls 30 \
   --stop-after-stable-scrolls 4 \
   --delay-seconds 2.0 \
+  --db-path data/airbnb_search_results.db \
   --output data/airbnb_search_results.json
 ```
 
@@ -96,5 +97,15 @@ python scripts/extract_airbnb_search_results.py \
   --max-scrolls 30 \
   --stop-after-stable-scrolls 4 \
   --delay-seconds 2.0 \
+  --db-path data/airbnb_search_results.db \
   --output data/airbnb_search_results_batch.json
+```
+
+
+## 4) Dashboard UI
+
+```bash
+python src/airbnb_dashboard.py \
+  --db-path data/airbnb_search_results.db \
+  --port 8080
 ```

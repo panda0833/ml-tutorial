@@ -1,25 +1,7 @@
 #!/usr/bin/env python3
 """Extract Airbnb listing cards from one or more search results pages.
 
-Extracts per listing card:
-- listing_url (canonical rooms URL)
-- rating
-- review_count
-- date_range_text (e.g., "Mar 1–6")
-- total_price (e.g., 691)
-- nights (e.g., 5)
-- price_per_night
-- card_text (raw snippet for audit/debug)
-
-Usage (single URL):
-python scripts/extract_airbnb_search_results.py \
-  --url "https://www.airbnb.com/s/Arlington--VA/homes?..." \
-  --output data/airbnb_search_results.json
-
-Usage (multiple URLs from file):
-python scripts/extract_airbnb_search_results.py \
-  --urls-file scripts/airbnb_search_urls.txt \
-  --output data/airbnb_search_results_multi.json
+Also persists normalized listing records into SQLite for UI/reporting use.
 """
 
 from __future__ import annotations
@@ -28,6 +10,7 @@ import argparse
 import json
 import random
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -43,11 +26,29 @@ PRICE_LINE_RE = re.compile(r"\$([\d,]+)")
 NIGHTS_LINE_RE = re.compile(r"for\s*(\d+)\s*nights?", re.I)
 
 
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS listings (
+    listing_url TEXT PRIMARY KEY,
+    listing_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    rating REAL,
+    review_count INTEGER,
+    date_range_text TEXT,
+    total_price INTEGER,
+    nights INTEGER,
+    price_per_night REAL,
+    active INTEGER NOT NULL DEFAULT 1,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--url", help="Single Airbnb search results URL")
     p.add_argument("--urls-file", help="Path to text file containing one search URL per line")
     p.add_argument("--output", required=True, help="Output JSON path")
+    p.add_argument("--db-path", default="data/airbnb_search_results.db", help="SQLite DB path")
     p.add_argument("--max-scrolls", type=int, default=30, help="Maximum number of scroll iterations")
     p.add_argument("--stop-after-stable-scrolls", type=int, default=4, help="Stop after this many scrolls with no new listing URLs")
     p.add_argument("--scroll-delay-seconds", type=float, default=1.5)
@@ -127,7 +128,6 @@ def _load_urls(args: argparse.Namespace) -> list[str]:
             line = line.strip()
             if line and not line.startswith("#"):
                 urls.append(line)
-    # preserve order, dedupe
     return list(dict.fromkeys(urls))
 
 
@@ -223,6 +223,54 @@ def _extract_from_search_page(page, url: str, args: argparse.Namespace) -> dict[
     }
 
 
+def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
+    db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(SCHEMA_SQL)
+
+        for source in payload.get("sources", []):
+            source_url = source.get("source_url")
+            if not source_url:
+                continue
+
+            conn.execute("UPDATE listings SET active = 0 WHERE source_url = ?", (source_url,))
+            for row in source.get("results", []):
+                conn.execute(
+                    """
+                    INSERT INTO listings (
+                        listing_url, listing_id, source_url, rating, review_count,
+                        date_range_text, total_price, nights, price_per_night, active, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(listing_url) DO UPDATE SET
+                        listing_id=excluded.listing_id,
+                        source_url=excluded.source_url,
+                        rating=excluded.rating,
+                        review_count=excluded.review_count,
+                        date_range_text=excluded.date_range_text,
+                        total_price=excluded.total_price,
+                        nights=excluded.nights,
+                        price_per_night=excluded.price_per_night,
+                        active=1,
+                        last_seen_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        row.get("listing_url"),
+                        row.get("listing_id"),
+                        source_url,
+                        row.get("rating"),
+                        row.get("review_count"),
+                        row.get("date_range_text"),
+                        row.get("total_price"),
+                        row.get("nights"),
+                        row.get("price_per_night"),
+                    ),
+                )
+
+        conn.commit()
+
+
 def main() -> None:
     args = parse_args()
     urls = _load_urls(args)
@@ -250,7 +298,11 @@ def main() -> None:
         "total_listings": sum(s.get("count", 0) for s in per_source),
     }
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"Wrote {out_path} ({payload['total_sources']} sources, {payload['total_listings']} listings)")
+    persist_results_to_db(payload, args.db_path)
+    print(
+        f"Wrote {out_path} ({payload['total_sources']} sources, {payload['total_listings']} listings); "
+        f"updated database {args.db_path}"
+    )
 
 
 if __name__ == "__main__":

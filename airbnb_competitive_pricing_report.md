@@ -153,7 +153,9 @@ For this run I used Playwright browser automation in page context to click **Che
 - `scripts/extract_airbnb_forward_calendar.py`
 - `scripts/airbnb_extraction_commands.md` (exact command lines with all 19 URLs)
 - `scripts/requirements-airbnb-extraction.txt` (Python package requirements)
-- `scripts/extract_airbnb_search_results.py` (extract listing URLs + rating/reviews + dates/prices from search result pages)
+- `scripts/extract_airbnb_search_results.py` (extract listing URLs + rating/reviews + dates/prices from search result pages; persists into SQLite with `active` flag)
+- `scripts/airbnb_search_urls.txt` (batch input file of search URLs)
+- `src/airbnb_dashboard.py` (UI component that reads from SQLite and renders listings on a webpage)
 
 
 Rate-limiting note: extraction scripts include `--delay-seconds` (default `2.0`) plus jitter between requests to avoid burst request patterns.
