@@ -91,6 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", required=True, help="Output JSON path")
     p.add_argument("--db-path", default="data/airbnb_search_results.db", help="SQLite DB path")
     p.add_argument("--max-scrolls", type=int, default=30, help="Maximum number of scroll iterations")
+    p.add_argument("--max-listings-per-url", type=int, default=3, help="For testing, cap extracted listings per source URL")
     p.add_argument("--stop-after-stable-scrolls", type=int, default=4, help="Stop after this many scrolls with no new listing URLs")
     p.add_argument("--scroll-delay-seconds", type=float, default=1.5)
     p.add_argument("--delay-seconds", type=float, default=2.0, help="Optional pre-extract delay")
@@ -328,7 +329,7 @@ def _extract_from_search_page(page, url: str, args: argparse.Namespace) -> dict[
         "center_lat": center_lat,
         "center_lng": center_lng,
         "count": len(by_listing),
-        "results": sorted(by_listing.values(), key=lambda x: int(x["listing_id"])),
+        "results": sorted(by_listing.values(), key=lambda x: int(x["listing_id"]))[: max(args.max_listings_per_url, 1)],
     }
 
 

@@ -203,7 +203,7 @@ def _band(count: int, max_count: int) -> int:
 RANGE_ISO_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?")
 
 
-def _expand_iso_ranges(raw: str | None) -> list[dt.date]:
+def _expand_iso_ranges(raw: str | None, min_date: dt.date) -> list[dt.date]:
     if not raw:
         return []
     try:
@@ -221,32 +221,44 @@ def _expand_iso_ranges(raw: str | None) -> list[dt.date]:
         end = dt.date.fromisoformat(m.group(2) or m.group(1))
         cur = start
         while cur <= end:
-            out.append(cur)
+            if cur >= min_date:
+                out.append(cur)
             cur += dt.timedelta(days=1)
     return out
 
 
 def build_calendars(rows: list[dict]) -> list[dict]:
     demand: dict[dt.date, int] = {}
+    observed_days: set[dt.date] = set()
+    today = dt.date.today()
 
     for r in rows:
         if not r.get("active"):
             continue
-        detail_days = _expand_iso_ranges(r.get("booked_ranges"))
-        if detail_days:
-            for d in detail_days:
+
+        booked_days = _expand_iso_ranges(r.get("booked_ranges"), today)
+        available_days = _expand_iso_ranges(r.get("available_ranges"), today)
+        if booked_days or available_days:
+            for d in available_days:
+                observed_days.add(d)
+            for d in booked_days:
+                observed_days.add(d)
                 demand[d] = demand.get(d, 0) + 1
             continue
-        current_year = dt.date.today().year
+
+        current_year = today.year
         for d in _expand_date_range(r.get("date_range_text") or "", current_year):
+            if d < today:
+                continue
+            observed_days.add(d)
             demand[d] = demand.get(d, 0) + 1
 
-    if not demand:
+    if not observed_days:
         return []
 
-    min_date = min(demand)
-    max_date = max(demand)
-    max_count = max(demand.values())
+    min_date = min(observed_days)
+    max_date = max(observed_days)
+    max_count = max(demand.values()) if demand else 0
 
     calendars: list[dict] = []
     ym = dt.date(min_date.year, min_date.month, 1)
@@ -309,7 +321,7 @@ def load_grouped_rows(db_path: str) -> list[dict]:
         table_names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         has_comp = "listing_competitive_stats" in table_names
         comp_join = "LEFT JOIN listing_competitive_stats c ON c.listing_url = l.listing_url" if has_comp else ""
-        comp_cols = "c.guests, c.bedrooms, c.beds, c.bathrooms, c.vacancy_pct, c.occupancy_pct, c.booked_ranges" if has_comp else "NULL AS guests, NULL AS bedrooms, NULL AS beds, NULL AS bathrooms, NULL AS vacancy_pct, NULL AS occupancy_pct, NULL AS booked_ranges"
+        comp_cols = "c.guests, c.bedrooms, c.beds, c.bathrooms, c.vacancy_pct, c.occupancy_pct, c.booked_ranges, c.available_ranges" if has_comp else "NULL AS guests, NULL AS bedrooms, NULL AS beds, NULL AS bathrooms, NULL AS vacancy_pct, NULL AS occupancy_pct, NULL AS booked_ranges, NULL AS available_ranges"
         rows = conn.execute(
             f"""
             SELECT l.listing_id, l.listing_url, l.source_url,
