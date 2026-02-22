@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import datetime as dt
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -65,46 +66,45 @@ HTML = """
     </div>
 
     <div class="card">
-      <h2>Demand heat calendar (from active listing date ranges)</h2>
-      <div class="legend">
-        <span><span class="dot c0"></span> Low/no demand</span>
-        <span><span class="dot c1"></span> Mild</span>
-        <span><span class="dot c2"></span> Medium</span>
-        <span><span class="dot c3"></span> High</span>
-        <span><span class="dot c4"></span> Very high</span>
-      </div>
-      {% if calendars %}
-      <div class="months">
-        {% for m in calendars %}
-          <div class="month">
-            <h3>{{ m.label }}</h3>
-            <div class="dow"><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Sun</div></div>
-            {% for week in m.weeks %}
-              <div class="week">
-                {% for d in week %}
-                  {% if d.empty %}
-                    <div class="day empty"></div>
-                  {% else %}
-                    <div class="day c{{ d.band }}" title="{{ d.iso }} demand={{ d.count }}">
-                      <span class="daynum">{{ d.day }}</span>
-                      <span class="count">{{ d.count }}</span>
-                    </div>
-                  {% endif %}
+      {% for g in groups %}
+        <h2>{{ g.label }}</h2>
+        <div class="section-meta">Source: <code>{{ g.source_url }}</code> · center {{ g.center_text }} · {{ g.rows|length }} listings</div>
+
+        <h3>Demand heat calendar ({{ g.label }})</h3>
+        <div class="legend">
+          <span><span class="dot c0"></span> Low/no demand</span>
+          <span><span class="dot c1"></span> Mild</span>
+          <span><span class="dot c2"></span> Medium</span>
+          <span><span class="dot c3"></span> High</span>
+          <span><span class="dot c4"></span> Very high</span>
+        </div>
+        {% if g.calendars %}
+          <div class="months">
+            {% for m in g.calendars %}
+              <div class="month">
+                <h3>{{ m.label }}</h3>
+                <div class="dow"><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Sun</div></div>
+                {% for week in m.weeks %}
+                  <div class="week">
+                    {% for d in week %}
+                      {% if d.empty %}
+                        <div class="day empty"></div>
+                      {% else %}
+                        <div class="day c{{ d.band }}" title="{{ d.iso }} demand={{ d.count }}">
+                          <span class="daynum">{{ d.day }}</span>
+                          <span class="count">{{ d.count }}</span>
+                        </div>
+                      {% endif %}
+                    {% endfor %}
+                  </div>
                 {% endfor %}
               </div>
             {% endfor %}
           </div>
-        {% endfor %}
-      </div>
-      {% else %}
-        <div class="muted">No date-range demand data available yet.</div>
-      {% endif %}
-    </div>
+        {% else %}
+          <div class="muted">No competitive-calendar data yet for this source URL.</div>
+        {% endif %}
 
-    <div class="card">
-      {% for g in groups %}
-        <h2>{{ g.label }}</h2>
-        <div class="section-meta">Source: <code>{{ g.source_url }}</code> · {{ g.rows|length }} listings</div>
         <table>
           <thead>
             <tr>
@@ -116,6 +116,9 @@ HTML = """
               <th>Total Price</th>
               <th>Nights</th>
               <th>Date Range</th>
+              <th>Bedrooms/Beds/Baths</th>
+              <th>Vacancy %</th>
+              <th>Occupancy %</th>
               <th>Last Seen</th>
             </tr>
           </thead>
@@ -136,6 +139,9 @@ HTML = """
               <td>{% if r['total_price'] is not none %}${{ r['total_price'] }}{% else %}—{% endif %}</td>
               <td>{{ r['nights'] if r['nights'] is not none else '—' }}</td>
               <td>{{ r['date_range_text'] or '—' }}</td>
+              <td>{{ r['bedrooms'] if r['bedrooms'] is not none else '—' }}/{{ r['beds'] if r['beds'] is not none else '—' }}/{{ r['bathrooms'] if r['bathrooms'] is not none else '—' }}</td>
+              <td>{% if r['vacancy_pct'] is not none %}{{ '%.1f'|format(r['vacancy_pct']) }}%{% else %}—{% endif %}</td>
+              <td>{% if r['occupancy_pct'] is not none %}{{ '%.1f'|format(r['occupancy_pct']) }}%{% else %}—{% endif %}</td>
               <td>{{ r['last_seen_at'] }}</td>
             </tr>
             {% endfor %}
@@ -194,13 +200,44 @@ def _band(count: int, max_count: int) -> int:
     return 4
 
 
+RANGE_ISO_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?")
+
+
+def _expand_iso_ranges(raw: str | None) -> list[dt.date]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[dt.date] = []
+    for item in parsed:
+        m = RANGE_ISO_RE.match(str(item))
+        if not m:
+            continue
+        start = dt.date.fromisoformat(m.group(1))
+        end = dt.date.fromisoformat(m.group(2) or m.group(1))
+        cur = start
+        while cur <= end:
+            out.append(cur)
+            cur += dt.timedelta(days=1)
+    return out
+
+
 def build_calendars(rows: list[dict]) -> list[dict]:
-    current_year = dt.date.today().year
     demand: dict[dt.date, int] = {}
 
     for r in rows:
         if not r.get("active"):
             continue
+        detail_days = _expand_iso_ranges(r.get("booked_ranges"))
+        if detail_days:
+            for d in detail_days:
+                demand[d] = demand.get(d, 0) + 1
+            continue
+        current_year = dt.date.today().year
         for d in _expand_date_range(r.get("date_range_text") or "", current_year):
             demand[d] = demand.get(d, 0) + 1
 
@@ -258,27 +295,50 @@ def load_grouped_rows(db_path: str) -> list[dict]:
     with sqlite3.connect(db_file) as conn:
         conn.row_factory = sqlite3.Row
         cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
-        source_label_expr = "COALESCE(source_label, source_url)" if "source_label" in cols else "source_url"
+        source_label_expr = "COALESCE(l.source_url)"
+        if "source_display" in cols and "source_label" in cols:
+            source_label_expr = "COALESCE(l.source_display, l.source_label, l.source_url)"
+        elif "source_label" in cols:
+            source_label_expr = "COALESCE(l.source_label, l.source_url)"
+
+        if "center_lat" in cols and "center_lng" in cols:
+            center_expr = "CASE WHEN l.center_lat IS NOT NULL AND l.center_lng IS NOT NULL THEN printf('%.4f,%.4f', l.center_lat, l.center_lng) ELSE 'n/a' END"
+        else:
+            center_expr = "'n/a'"
+
+        table_names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        has_comp = "listing_competitive_stats" in table_names
+        comp_join = "LEFT JOIN listing_competitive_stats c ON c.listing_url = l.listing_url" if has_comp else ""
+        comp_cols = "c.guests, c.bedrooms, c.beds, c.bathrooms, c.vacancy_pct, c.occupancy_pct, c.booked_ranges" if has_comp else "NULL AS guests, NULL AS bedrooms, NULL AS beds, NULL AS bathrooms, NULL AS vacancy_pct, NULL AS occupancy_pct, NULL AS booked_ranges"
         rows = conn.execute(
             f"""
-            SELECT listing_id, listing_url, source_url,
+            SELECT l.listing_id, l.listing_url, l.source_url,
                    {source_label_expr} AS source_label,
-                   rating, review_count, date_range_text, total_price,
-                   nights, price_per_night, active, last_seen_at
-            FROM listings
-            ORDER BY source_label ASC, active DESC, rating DESC, review_count DESC, listing_id ASC
+                   {center_expr} AS center_text,
+                   l.rating, l.review_count, l.date_range_text, l.total_price,
+                   l.nights, l.price_per_night, l.active, l.last_seen_at,
+                   {comp_cols}
+            FROM listings l
+            {comp_join}
+            ORDER BY source_label ASC, l.active DESC, l.rating DESC, l.review_count DESC, l.listing_id ASC
             """
         ).fetchall()
 
     groups: dict[str, dict] = {}
     for r in rows:
         d = dict(r)
-        label = d.get("source_label") or d.get("source_url") or "Unknown source"
-        if label not in groups:
-            groups[label] = {"label": label, "source_url": d.get("source_url"), "rows": []}
-        groups[label]["rows"].append(d)
+        key = d.get("source_url") or "Unknown source"
+        label = d.get("source_label") or key
+        if key not in groups:
+            groups[key] = {"label": label, "source_url": key, "center_text": d.get("center_text") or "n/a", "rows": []}
+        groups[key]["rows"].append(d)
 
-    return list(groups.values())
+    out = []
+    for group in groups.values():
+        group["calendars"] = build_calendars(group["rows"])
+        out.append(group)
+
+    return out
 
 
 def main() -> None:
@@ -290,13 +350,11 @@ def main() -> None:
         groups = load_grouped_rows(args.db_path)
         all_rows = [r for g in groups for r in g["rows"]]
         total_rows = len(all_rows)
-        calendars = build_calendars(all_rows)
         return render_template_string(
             HTML,
             groups=groups,
             total_rows=total_rows,
             db_path=args.db_path,
-            calendars=calendars,
         )
 
     app.run(host=args.host, port=args.port, debug=False)

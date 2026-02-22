@@ -7,6 +7,7 @@ Also persists normalized listing records into SQLite for UI/reporting use.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
 import random
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse, parse_qs
+from urllib.request import Request, urlopen
 
 from playwright.sync_api import sync_playwright
 
@@ -26,6 +28,15 @@ DATE_RANGE_RE = re.compile(r"\b([A-Z][a-z]{2}\s+\d{1,2}\s*[–-]\s*\d{1,2})\b")
 PRICE_FOR_NIGHTS_RE = re.compile(r"\$([\d,]+)\s*for\s*(\d+)\s*nights?", re.I)
 PRICE_LINE_RE = re.compile(r"\$([\d,]+)")
 NIGHTS_LINE_RE = re.compile(r"for\s*(\d+)\s*nights?", re.I)
+CAPACITY_RE = re.compile(
+    r"(\d+)\s+guests?\s*·\s*(\d+)\s+bedrooms?\s*·\s*(\d+)\s+beds?\s*·\s*([\d.]+)\s+baths?",
+    re.IGNORECASE,
+)
+CAPACITY_RE_NO_BEDS = re.compile(
+    r"(\d+)\s+guests?\s*·\s*(\d+)\s+bedrooms?\s*·\s*([\d.]+)\s+baths?",
+    re.IGNORECASE,
+)
+CAL_DAY_RE = re.compile(r"calendar-day-(\d{2}/\d{2}/\d{4})")
 
 logger = logging.getLogger("airbnb_search_extractor")
 
@@ -35,6 +46,9 @@ CREATE TABLE IF NOT EXISTS listings (
     listing_id TEXT NOT NULL,
     source_url TEXT NOT NULL,
     source_label TEXT,
+    source_display TEXT,
+    center_lat REAL,
+    center_lng REAL,
     rating REAL,
     review_count INTEGER,
     date_range_text TEXT,
@@ -43,6 +57,29 @@ CREATE TABLE IF NOT EXISTS listings (
     price_per_night REAL,
     active INTEGER NOT NULL DEFAULT 1,
     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+COMPETITIVE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS listing_competitive_stats (
+    listing_url TEXT PRIMARY KEY,
+    listing_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    rating REAL,
+    review_count INTEGER,
+    guests INTEGER,
+    bedrooms INTEGER,
+    beds INTEGER,
+    bathrooms REAL,
+    forward_days INTEGER,
+    days_booked INTEGER,
+    days_not_booked INTEGER,
+    vacancy_pct REAL,
+    occupancy_pct REAL,
+    booked_ranges TEXT,
+    available_ranges TEXT,
+    min_stay_note TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -58,6 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scroll-delay-seconds", type=float, default=1.5)
     p.add_argument("--delay-seconds", type=float, default=2.0, help="Optional pre-extract delay")
     p.add_argument("--timeout-ms", type=int, default=90_000)
+    p.add_argument("--start-date", help="Forward-calendar start date (YYYY-MM-DD). Defaults to first day of next month.")
+    p.add_argument("--skip-competitive-details", action="store_true", help="Skip per-listing competitive stats extraction")
     p.add_argument("--log-level", default="DEBUG", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = p.parse_args()
     if not args.url and not args.urls_file:
@@ -75,6 +114,44 @@ def source_label_from_url(url: str) -> str:
     if len(parts) >= 2 and parts[0] == "s":
         return unquote(parts[1]).replace("--", " ")
     return parsed.netloc
+
+
+def source_center_from_url(url: str) -> tuple[float | None, float | None]:
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    ne_lat = qs.get("ne_lat", [None])[0]
+    ne_lng = qs.get("ne_lng", [None])[0]
+    sw_lat = qs.get("sw_lat", [None])[0]
+    sw_lng = qs.get("sw_lng", [None])[0]
+    try:
+        if all([ne_lat, ne_lng, sw_lat, sw_lng]):
+            return (float(ne_lat) + float(sw_lat)) / 2.0, (float(ne_lng) + float(sw_lng)) / 2.0
+    except ValueError:
+        return None, None
+    return None, None
+
+
+def reverse_geocode_label(lat: float | None, lng: float | None, fallback: str) -> str:
+    if lat is None or lng is None:
+        return fallback
+    req = Request(
+        f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lng}",
+        headers={"User-Agent": "ml-tutorial-airbnb-extractor/1.0"},
+    )
+    try:
+        with urlopen(req, timeout=4) as resp:  # noqa: S310
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return f"{fallback}, map {lat:.4f},{lng:.4f}"
+
+    addr = payload.get("address", {}) if isinstance(payload, dict) else {}
+    area = addr.get("suburb") or addr.get("neighbourhood") or addr.get("city_district") or addr.get("town")
+    city = addr.get("city") or addr.get("town") or addr.get("village")
+    if city and area and area.lower() != city.lower():
+        return f"{city}, {area}"
+    if city:
+        return city
+    return f"{fallback}, map {lat:.4f},{lng:.4f}"
 
 
 def short_source(url: str) -> str:
@@ -155,6 +232,8 @@ def _load_urls(args: argparse.Namespace) -> list[str]:
 
 def _extract_from_search_page(page, url: str, args: argparse.Namespace) -> dict[str, Any]:
     source_label = source_label_from_url(url)
+    center_lat, center_lng = source_center_from_url(url)
+    source_display = reverse_geocode_label(center_lat, center_lng, source_label)
     logger.info("Processing source: %s", short_source(url))
 
     page.goto(url, wait_until="domcontentloaded", timeout=args.timeout_ms)
@@ -245,16 +324,142 @@ def _extract_from_search_page(page, url: str, args: argparse.Namespace) -> dict[
     return {
         "source_url": url,
         "source_label": source_label,
+        "source_display": source_display,
+        "center_lat": center_lat,
+        "center_lng": center_lng,
         "count": len(by_listing),
         "results": sorted(by_listing.values(), key=lambda x: int(x["listing_id"])),
     }
 
 
+def compress_ranges(dates: list[str]) -> list[str]:
+    if not dates:
+        return []
+    dts = [dt.date.fromisoformat(d) for d in sorted(dates)]
+    out: list[tuple[dt.date, dt.date]] = []
+    start = prev = dts[0]
+    for cur in dts[1:]:
+        if cur - prev == dt.timedelta(days=1):
+            prev = cur
+            continue
+        out.append((start, prev))
+        start = prev = cur
+    out.append((start, prev))
+    return [f"{a.isoformat()} to {b.isoformat()}" if a != b else a.isoformat() for a, b in out]
+
+
+def _extract_competitive_details(page, listing_url: str, start_date: dt.date, timeout_ms: int) -> dict[str, Any]:
+    page.goto(listing_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.wait_for_timeout(1200)
+
+    rating = None
+    review_count = None
+    for block in page.locator('script[type="application/ld+json"]').all_text_contents():
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        candidates = parsed if isinstance(parsed, list) else [parsed]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            agg = obj.get("aggregateRating")
+            if isinstance(agg, dict):
+                rating = agg.get("ratingValue", rating)
+                review_count = agg.get("reviewCount", review_count)
+
+    text = page.evaluate('document.body ? document.body.innerText : ""')
+    guests = bedrooms = beds = bathrooms = None
+    m = CAPACITY_RE.search(text)
+    if m:
+        guests, bedrooms, beds, bathrooms = m.groups()
+    else:
+        m2 = CAPACITY_RE_NO_BEDS.search(text)
+        if m2:
+            guests, bedrooms, bathrooms = m2.groups()
+
+    opened = False
+    for sel in ['button[data-testid="homes-pdp-cta-btn"]', "button:has-text('Check availability')"]:
+        try:
+            page.locator(sel).first.click(timeout=10_000)
+            opened = True
+            break
+        except Exception:
+            continue
+
+    if not opened:
+        return {
+            "rating": rating,
+            "review_count": _to_int(str(review_count)) if review_count is not None else None,
+            "guests": _to_int(guests),
+            "bedrooms": _to_int(bedrooms),
+            "beds": _to_int(beds),
+            "bathrooms": float(bathrooms) if bathrooms else None,
+            "min_stay_note": "calendar button not found",
+        }
+
+    for sel in ['button[data-testid="calendar-next-button"]', 'button[aria-label*="Next"]', 'button[aria-label*="next"]']:
+        try:
+            page.locator(sel).first.click(timeout=2_000)
+            break
+        except Exception:
+            continue
+    page.wait_for_timeout(700)
+
+    raw_days = page.eval_on_selector_all(
+        '[data-testid^="calendar-day-"]',
+        "els => els.map(el => [el.getAttribute('data-testid'), el.getAttribute('data-is-day-blocked'), el.getAttribute('aria-label') || el.parentElement?.getAttribute('aria-label') || ''])",
+    )
+    by_date: dict[str, bool] = {}
+    min_stay_note = None
+    for testid, blocked, aria_label in raw_days:
+        mday = CAL_DAY_RE.match(testid or "")
+        if not mday:
+            continue
+        date_iso = dt.datetime.strptime(mday.group(1), "%m/%d/%Y").date().isoformat()
+        if dt.date.fromisoformat(date_iso) < start_date:
+            continue
+        by_date[date_iso] = blocked == "true"
+        label = (aria_label or "").lower()
+        if "minimum stay" in label:
+            min_stay_note = "minimum stay restrictions present"
+
+    dates = sorted(by_date)
+    booked = [d for d in dates if by_date[d]]
+    available = [d for d in dates if not by_date[d]]
+    total = len(dates)
+    days_booked = len(booked)
+    days_not_booked = len(available)
+    return {
+        "rating": float(rating) if rating is not None else None,
+        "review_count": _to_int(str(review_count)) if review_count is not None else None,
+        "guests": _to_int(guests),
+        "bedrooms": _to_int(bedrooms),
+        "beds": _to_int(beds),
+        "bathrooms": float(bathrooms) if bathrooms else None,
+        "forward_days": total,
+        "days_booked": days_booked,
+        "days_not_booked": days_not_booked,
+        "vacancy_pct": round((days_not_booked / total) * 100, 1) if total else None,
+        "occupancy_pct": round((days_booked / total) * 100, 1) if total else None,
+        "booked_ranges": compress_ranges(booked),
+        "available_ranges": compress_ranges(available),
+        "min_stay_note": min_stay_note,
+    }
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(SCHEMA_SQL)
+    conn.execute(COMPETITIVE_SCHEMA_SQL)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
     if "source_label" not in cols:
         conn.execute("ALTER TABLE listings ADD COLUMN source_label TEXT")
+    if "source_display" not in cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN source_display TEXT")
+    if "center_lat" not in cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN center_lat REAL")
+    if "center_lng" not in cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN center_lng REAL")
 
 
 def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
@@ -267,6 +472,9 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
         for source in payload.get("sources", []):
             source_url = source.get("source_url")
             source_label = source.get("source_label") or source_label_from_url(source_url or "")
+            source_display = source.get("source_display") or source_label
+            center_lat = source.get("center_lat")
+            center_lng = source.get("center_lng")
             if not source_url:
                 continue
 
@@ -276,12 +484,16 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
                     """
                     INSERT INTO listings (
                         listing_url, listing_id, source_url, source_label, rating, review_count,
-                        date_range_text, total_price, nights, price_per_night, active, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                        source_display, center_lat, center_lng, date_range_text, total_price, nights,
+                        price_per_night, active, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
                     ON CONFLICT(listing_url) DO UPDATE SET
                         listing_id=excluded.listing_id,
                         source_url=excluded.source_url,
                         source_label=excluded.source_label,
+                        source_display=excluded.source_display,
+                        center_lat=excluded.center_lat,
+                        center_lng=excluded.center_lng,
                         rating=excluded.rating,
                         review_count=excluded.review_count,
                         date_range_text=excluded.date_range_text,
@@ -298,6 +510,9 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
                         source_label,
                         row.get("rating"),
                         row.get("review_count"),
+                        source_display,
+                        center_lat,
+                        center_lng,
                         row.get("date_range_text"),
                         row.get("total_price"),
                         row.get("nights"),
@@ -305,6 +520,61 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
                     ),
                 )
 
+
+def persist_competitive_to_db(rows: list[dict[str, Any]], db_path: str) -> None:
+    if not rows:
+        return
+    with sqlite3.connect(db_path) as conn:
+        _ensure_schema(conn)
+        for r in rows:
+            conn.execute(
+                """
+                INSERT INTO listing_competitive_stats (
+                    listing_url, listing_id, source_url, rating, review_count,
+                    guests, bedrooms, beds, bathrooms,
+                    forward_days, days_booked, days_not_booked,
+                    vacancy_pct, occupancy_pct, booked_ranges, available_ranges,
+                    min_stay_note, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(listing_url) DO UPDATE SET
+                    listing_id=excluded.listing_id,
+                    source_url=excluded.source_url,
+                    rating=excluded.rating,
+                    review_count=excluded.review_count,
+                    guests=excluded.guests,
+                    bedrooms=excluded.bedrooms,
+                    beds=excluded.beds,
+                    bathrooms=excluded.bathrooms,
+                    forward_days=excluded.forward_days,
+                    days_booked=excluded.days_booked,
+                    days_not_booked=excluded.days_not_booked,
+                    vacancy_pct=excluded.vacancy_pct,
+                    occupancy_pct=excluded.occupancy_pct,
+                    booked_ranges=excluded.booked_ranges,
+                    available_ranges=excluded.available_ranges,
+                    min_stay_note=excluded.min_stay_note,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    r.get("listing_url"),
+                    r.get("listing_id"),
+                    r.get("source_url"),
+                    r.get("rating"),
+                    r.get("review_count"),
+                    r.get("guests"),
+                    r.get("bedrooms"),
+                    r.get("beds"),
+                    r.get("bathrooms"),
+                    r.get("forward_days"),
+                    r.get("days_booked"),
+                    r.get("days_not_booked"),
+                    r.get("vacancy_pct"),
+                    r.get("occupancy_pct"),
+                    json.dumps(r.get("booked_ranges") or []),
+                    json.dumps(r.get("available_ranges") or []),
+                    r.get("min_stay_note"),
+                ),
+            )
         conn.commit()
 
 
@@ -315,7 +585,14 @@ def main() -> None:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.start_date:
+        start_date = dt.date.fromisoformat(args.start_date)
+    else:
+        today = dt.date.today()
+        start_date = dt.date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, 1)
+
     per_source: list[dict[str, Any]] = []
+    competitive_rows: list[dict[str, Any]] = []
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=True)
         context = browser.new_context(locale="en-US")
@@ -335,6 +612,29 @@ def main() -> None:
             finally:
                 page.close()
             _sleep_with_jitter(args.delay_seconds)
+
+        if not args.skip_competitive_details:
+            for source in per_source:
+                src_url = source.get("source_url")
+                for row in source.get("results", []):
+                    listing_url = row.get("listing_url")
+                    if not listing_url:
+                        continue
+                    logger.info("[competitive] %s :: %s", short_source(src_url or ""), row.get("listing_id"))
+                    lp = context.new_page()
+                    try:
+                        details = _extract_competitive_details(lp, listing_url, start_date=start_date, timeout_ms=args.timeout_ms)
+                        competitive_rows.append({
+                            "listing_url": listing_url,
+                            "listing_id": row.get("listing_id"),
+                            "source_url": src_url,
+                            **details,
+                        })
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Failed competitive details for %s: %s", listing_url, exc)
+                    finally:
+                        lp.close()
+                    _sleep_with_jitter(args.delay_seconds)
         browser.close()
 
     payload = {
@@ -344,6 +644,8 @@ def main() -> None:
     }
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     persist_results_to_db(payload, args.db_path)
+    if not args.skip_competitive_details:
+        persist_competitive_to_db(competitive_rows, args.db_path)
     logger.info(
         "Wrote %s (%s sources, %s listings); updated database %s",
         out_path,
