@@ -33,7 +33,7 @@ source .venv/bin/activate
 ## 4) Install Python deps + Playwright browser
 
 ```bash
-pip install -r scripts/requirements-airbnb-extraction.txt
+pip install -r requirements.txt
 python -m playwright install firefox
 ```
 

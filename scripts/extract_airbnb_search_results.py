@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import re
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse, parse_qs
 
 from playwright.sync_api import sync_playwright
 
@@ -25,12 +27,14 @@ PRICE_FOR_NIGHTS_RE = re.compile(r"\$([\d,]+)\s*for\s*(\d+)\s*nights?", re.I)
 PRICE_LINE_RE = re.compile(r"\$([\d,]+)")
 NIGHTS_LINE_RE = re.compile(r"for\s*(\d+)\s*nights?", re.I)
 
+logger = logging.getLogger("airbnb_search_extractor")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS listings (
     listing_url TEXT PRIMARY KEY,
     listing_id TEXT NOT NULL,
     source_url TEXT NOT NULL,
+    source_label TEXT,
     rating REAL,
     review_count INTEGER,
     date_range_text TEXT,
@@ -54,10 +58,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scroll-delay-seconds", type=float, default=1.5)
     p.add_argument("--delay-seconds", type=float, default=2.0, help="Optional pre-extract delay")
     p.add_argument("--timeout-ms", type=int, default=90_000)
+    p.add_argument("--log-level", default="DEBUG", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = p.parse_args()
     if not args.url and not args.urls_file:
         p.error("Provide either --url or --urls-file")
     return args
+
+
+def source_label_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    query = qs.get("query", [None])[0]
+    if query:
+        return unquote(query)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "s":
+        return unquote(parts[1]).replace("--", " ")
+    return parsed.netloc
+
+
+def short_source(url: str) -> str:
+    label = source_label_from_url(url)
+    return f"{label[:42]}..." if len(label) > 45 else label
 
 
 def _sleep_with_jitter(base: float) -> None:
@@ -132,6 +154,9 @@ def _load_urls(args: argparse.Namespace) -> list[str]:
 
 
 def _extract_from_search_page(page, url: str, args: argparse.Namespace) -> dict[str, Any]:
+    source_label = source_label_from_url(url)
+    logger.info("Processing source: %s", short_source(url))
+
     page.goto(url, wait_until="domcontentloaded", timeout=args.timeout_ms)
     _sleep_with_jitter(args.delay_seconds)
 
@@ -215,12 +240,21 @@ def _extract_from_search_page(page, url: str, args: argparse.Namespace) -> dict[
                 **parsed,
                 "card_text": row.get("card_text", "")[:500],
             }
+            logger.info("[%s] listing_id=%s", short_source(url), listing_id)
 
     return {
         "source_url": url,
+        "source_label": source_label,
         "count": len(by_listing),
         "results": sorted(by_listing.values(), key=lambda x: int(x["listing_id"])),
     }
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(SCHEMA_SQL)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
+    if "source_label" not in cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN source_label TEXT")
 
 
 def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
@@ -228,10 +262,11 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(db_file) as conn:
-        conn.execute(SCHEMA_SQL)
+        _ensure_schema(conn)
 
         for source in payload.get("sources", []):
             source_url = source.get("source_url")
+            source_label = source.get("source_label") or source_label_from_url(source_url or "")
             if not source_url:
                 continue
 
@@ -240,12 +275,13 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
                 conn.execute(
                     """
                     INSERT INTO listings (
-                        listing_url, listing_id, source_url, rating, review_count,
+                        listing_url, listing_id, source_url, source_label, rating, review_count,
                         date_range_text, total_price, nights, price_per_night, active, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
                     ON CONFLICT(listing_url) DO UPDATE SET
                         listing_id=excluded.listing_id,
                         source_url=excluded.source_url,
+                        source_label=excluded.source_label,
                         rating=excluded.rating,
                         review_count=excluded.review_count,
                         date_range_text=excluded.date_range_text,
@@ -259,6 +295,7 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
                         row.get("listing_url"),
                         row.get("listing_id"),
                         source_url,
+                        source_label,
                         row.get("rating"),
                         row.get("review_count"),
                         row.get("date_range_text"),
@@ -273,6 +310,7 @@ def persist_results_to_db(payload: dict[str, Any], db_path: str) -> None:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(message)s")
     urls = _load_urls(args)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,7 +324,14 @@ def main() -> None:
             try:
                 per_source.append(_extract_from_search_page(page, url, args))
             except Exception as exc:  # noqa: BLE001
-                per_source.append({"source_url": url, "error": str(exc), "count": 0, "results": []})
+                per_source.append({
+                    "source_url": url,
+                    "source_label": source_label_from_url(url),
+                    "error": str(exc),
+                    "count": 0,
+                    "results": [],
+                })
+                logger.error("Failed source %s: %s", short_source(url), exc)
             finally:
                 page.close()
             _sleep_with_jitter(args.delay_seconds)
@@ -299,9 +344,12 @@ def main() -> None:
     }
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     persist_results_to_db(payload, args.db_path)
-    print(
-        f"Wrote {out_path} ({payload['total_sources']} sources, {payload['total_listings']} listings); "
-        f"updated database {args.db_path}"
+    logger.info(
+        "Wrote %s (%s sources, %s listings); updated database %s",
+        out_path,
+        payload["total_sources"],
+        payload["total_listings"],
+        args.db_path,
     )
 
 

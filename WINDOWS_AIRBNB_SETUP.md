@@ -42,7 +42,7 @@ Then activate again.
 ## 4) Install dependencies
 
 ```powershell
-pip install -r scripts/requirements-airbnb-extraction.txt
+pip install -r requirements.txt
 python -m playwright install firefox
 ```
 
@@ -99,3 +99,9 @@ Each time you want fresh data:
 - **No rows in UI**: confirm extractor completed and DB path matches:
   - extractor `--db-path`
   - dashboard `--db-path`
+
+
+## Shortcut: run with one command
+
+- Windows PowerShell: `./run_airbnb_search_results.ps1`
+- Linux/WSL: `./run_airbnb_search_results.sh`
