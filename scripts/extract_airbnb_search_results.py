@@ -36,6 +36,10 @@ CAPACITY_RE_NO_BEDS = re.compile(
     r"(\d+)\s+guests?\s*·\s*(\d+)\s+bedrooms?\s*·\s*([\d.]+)\s+baths?",
     re.IGNORECASE,
 )
+BEDROOM_RE = re.compile(r"(\d+)\s+bedrooms?", re.IGNORECASE)
+BEDS_RE = re.compile(r"(\d+)\s+beds?", re.IGNORECASE)
+BATH_RE = re.compile(r"([\d.]+)\s+baths?", re.IGNORECASE)
+GUEST_RE = re.compile(r"(\d+)\s+guests?", re.IGNORECASE)
 CAL_DAY_RE = re.compile(r"calendar-day-(\d{2}/\d{2}/\d{4})")
 
 logger = logging.getLogger("airbnb_search_extractor")
@@ -170,6 +174,35 @@ def _to_int(num_text: str | None) -> int | None:
     if not num_text:
         return None
     return int(num_text.replace(",", ""))
+
+
+def _parse_capacity(text: str) -> tuple[int | None, int | None, int | None, float | None]:
+    guests = bedrooms = beds = None
+    bathrooms = None
+    m = CAPACITY_RE.search(text)
+    if m:
+        g, br, bd, ba = m.groups()
+        return _to_int(g), _to_int(br), _to_int(bd), float(ba)
+
+    m2 = CAPACITY_RE_NO_BEDS.search(text)
+    if m2:
+        g, br, ba = m2.groups()
+        guests, bedrooms, bathrooms = _to_int(g), _to_int(br), float(ba)
+
+    if guests is None:
+        gm = GUEST_RE.search(text)
+        guests = _to_int(gm.group(1)) if gm else None
+    if bedrooms is None:
+        bm = BEDROOM_RE.search(text)
+        bedrooms = _to_int(bm.group(1)) if bm else None
+    if beds is None:
+        bedm = BEDS_RE.search(text)
+        beds = _to_int(bedm.group(1)) if bedm else None
+    if bathrooms is None:
+        bathm = BATH_RE.search(text)
+        bathrooms = float(bathm.group(1)) if bathm else None
+
+    return guests, bedrooms, beds, bathrooms
 
 
 def _parse_card_fields(card_text: str) -> dict[str, Any]:
@@ -350,6 +383,7 @@ def compress_ranges(dates: list[str]) -> list[str]:
 
 
 def _extract_competitive_details(page, listing_url: str, start_date: dt.date, timeout_ms: int) -> dict[str, Any]:
+    listing_id = room_id(listing_url)
     page.goto(listing_url, wait_until="domcontentloaded", timeout=timeout_ms)
     page.wait_for_timeout(1200)
 
@@ -370,14 +404,15 @@ def _extract_competitive_details(page, listing_url: str, start_date: dt.date, ti
                 review_count = agg.get("reviewCount", review_count)
 
     text = page.evaluate('document.body ? document.body.innerText : ""')
-    guests = bedrooms = beds = bathrooms = None
-    m = CAPACITY_RE.search(text)
-    if m:
-        guests, bedrooms, beds, bathrooms = m.groups()
-    else:
-        m2 = CAPACITY_RE_NO_BEDS.search(text)
-        if m2:
-            guests, bedrooms, bathrooms = m2.groups()
+    guests, bedrooms, beds, bathrooms = _parse_capacity(text)
+    if bedrooms is None or bathrooms is None:
+        logger.warning(
+            "[%s] capacity parse incomplete (bedrooms=%s bathrooms=%s). text sample=%r",
+            listing_id,
+            bedrooms,
+            bathrooms,
+            text[:220],
+        )
 
     opened = False
     for sel in ['button[data-testid="homes-pdp-cta-btn"]', "button:has-text('Check availability')"]:
@@ -389,13 +424,14 @@ def _extract_competitive_details(page, listing_url: str, start_date: dt.date, ti
             continue
 
     if not opened:
+        logger.warning("[%s] calendar button not found", listing_id)
         return {
             "rating": rating,
             "review_count": _to_int(str(review_count)) if review_count is not None else None,
-            "guests": _to_int(guests),
-            "bedrooms": _to_int(bedrooms),
-            "beds": _to_int(beds),
-            "bathrooms": float(bathrooms) if bathrooms else None,
+            "guests": guests,
+            "bedrooms": bedrooms,
+            "beds": beds,
+            "bathrooms": bathrooms,
             "min_stay_note": "calendar button not found",
         }
 
@@ -425,6 +461,9 @@ def _extract_competitive_details(page, listing_url: str, start_date: dt.date, ti
         if "minimum stay" in label:
             min_stay_note = "minimum stay restrictions present"
 
+    if not by_date:
+        logger.warning("[%s] no forward calendar days parsed (start_date=%s)", listing_id, start_date.isoformat())
+
     dates = sorted(by_date)
     booked = [d for d in dates if by_date[d]]
     available = [d for d in dates if not by_date[d]]
@@ -434,10 +473,10 @@ def _extract_competitive_details(page, listing_url: str, start_date: dt.date, ti
     return {
         "rating": float(rating) if rating is not None else None,
         "review_count": _to_int(str(review_count)) if review_count is not None else None,
-        "guests": _to_int(guests),
-        "bedrooms": _to_int(bedrooms),
-        "beds": _to_int(beds),
-        "bathrooms": float(bathrooms) if bathrooms else None,
+        "guests": guests,
+        "bedrooms": bedrooms,
+        "beds": beds,
+        "bathrooms": bathrooms,
         "forward_days": total,
         "days_booked": days_booked,
         "days_not_booked": days_not_booked,
@@ -619,22 +658,44 @@ def main() -> None:
                 src_url = source.get("source_url")
                 for row in source.get("results", []):
                     listing_url = row.get("listing_url")
+                    listing_id = row.get("listing_id")
                     if not listing_url:
                         continue
-                    logger.info("[competitive] %s :: %s", short_source(src_url or ""), row.get("listing_id"))
-                    lp = context.new_page()
-                    try:
-                        details = _extract_competitive_details(lp, listing_url, start_date=start_date, timeout_ms=args.timeout_ms)
+                    logger.info("[competitive] %s :: %s", short_source(src_url or ""), listing_id)
+                    best_details: dict[str, Any] | None = None
+                    for attempt in range(1, 3):
+                        lp = context.new_page()
+                        try:
+                            details = _extract_competitive_details(lp, listing_url, start_date=start_date, timeout_ms=args.timeout_ms)
+                            best_details = details
+                            missing_capacity = details.get("bedrooms") is None or details.get("bathrooms") is None
+                            missing_calendar = details.get("forward_days") in (None, 0)
+                            if missing_capacity or missing_calendar:
+                                logger.warning(
+                                    "[competitive][%s] attempt %s incomplete: bedrooms=%s bathrooms=%s forward_days=%s",
+                                    listing_id,
+                                    attempt,
+                                    details.get("bedrooms"),
+                                    details.get("bathrooms"),
+                                    details.get("forward_days"),
+                                )
+                                if attempt < 2:
+                                    _sleep_with_jitter(1.2)
+                                    continue
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error("Failed competitive details for %s (attempt %s): %s", listing_url, attempt, exc)
+                            if attempt >= 2:
+                                break
+                        finally:
+                            lp.close()
+                    if best_details:
                         competitive_rows.append({
                             "listing_url": listing_url,
-                            "listing_id": row.get("listing_id"),
+                            "listing_id": listing_id,
                             "source_url": src_url,
-                            **details,
+                            **best_details,
                         })
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Failed competitive details for %s: %s", listing_url, exc)
-                    finally:
-                        lp.close()
                     _sleep_with_jitter(args.delay_seconds)
         browser.close()
 

@@ -185,17 +185,17 @@ def _expand_date_range(text: str, year: int) -> list[dt.date]:
     return dates
 
 
-def _band(count: int, max_count: int) -> int:
-    if max_count <= 0:
+def _band(count: int, active_listings: int) -> int:
+    if active_listings <= 0:
         return 0
-    ratio = count / max_count
+    ratio = count / active_listings
     if ratio <= 0:
         return 0
-    if ratio <= 0.25:
+    if ratio <= 0.2:
         return 1
-    if ratio <= 0.5:
+    if ratio <= 0.4:
         return 2
-    if ratio <= 0.75:
+    if ratio <= 0.65:
         return 3
     return 4
 
@@ -231,10 +231,10 @@ def build_calendars(rows: list[dict]) -> list[dict]:
     demand: dict[dt.date, int] = {}
     observed_days: set[dt.date] = set()
     today = dt.date.today()
+    active_rows = [r for r in rows if r.get("active")]
+    active_count = len(active_rows)
 
-    for r in rows:
-        if not r.get("active"):
-            continue
+    for r in active_rows:
 
         booked_days = _expand_iso_ranges(r.get("booked_ranges"), today)
         available_days = _expand_iso_ranges(r.get("available_ranges"), today)
@@ -258,8 +258,6 @@ def build_calendars(rows: list[dict]) -> list[dict]:
 
     min_date = min(observed_days)
     max_date = max(observed_days)
-    max_count = max(demand.values()) if demand else 0
-
     calendars: list[dict] = []
     ym = dt.date(min_date.year, min_date.month, 1)
     end_ym = dt.date(max_date.year, max_date.month, 1)
@@ -279,7 +277,7 @@ def build_calendars(rows: list[dict]) -> list[dict]:
                         "day": day.day,
                         "iso": day.isoformat(),
                         "count": c,
-                        "band": _band(c, max_count),
+                        "band": _band(c, active_count),
                     })
             weeks.append(w)
 
